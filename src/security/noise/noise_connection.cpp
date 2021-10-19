@@ -5,6 +5,7 @@
 
 #include <libp2p/security/noise/noise_connection.hpp>
 
+#include <libp2p/common/span_size.hpp>
 #include <libp2p/crypto/x25519_provider/x25519_provider_impl.hpp>
 #include <libp2p/security/noise/crypto/interfaces.hpp>
 
@@ -40,10 +41,7 @@ namespace libp2p::connection {
         frame_buffer_{
             std::make_shared<common::ByteArray>(security::noise::kMaxMsgLen)},
         framer_{std::make_shared<security::noise::InsecureReadWriter>(
-            raw_connection_, frame_buffer_)},
-        already_read_{0},
-        already_wrote_{0},
-        plaintext_len_to_write_{0} {
+            raw_connection_, frame_buffer_)} {
     BOOST_ASSERT(raw_connection_);
     BOOST_ASSERT(key_marshaller_);
     BOOST_ASSERT(encoder_cs_);
@@ -63,19 +61,21 @@ namespace libp2p::connection {
 
   void NoiseConnection::read(gsl::span<uint8_t> out, size_t bytes,
                              libp2p::basic::Reader::ReadCallbackFunc cb) {
-    size_t out_size{out.empty() ? 0u : static_cast<size_t>(out.size())};
-    BOOST_ASSERT(out_size >= bytes);
-    if (bytes == 0) {
-      auto n{already_read_};
-      already_read_ = 0;
-      return cb(n);
-    }
-    readSome(out, bytes,
-             [self{shared_from_this()}, out, bytes,
+    BOOST_ASSERT(spanSize(out) >= bytes);
+    readFull(out.first(gsl::narrow<ptrdiff_t>(bytes)), bytes, std::move(cb));
+  }
+
+  void NoiseConnection::readFull(gsl::span<uint8_t> out, size_t total,
+                                 ReadCallbackFunc cb) {
+    readSome(out, out.size(),
+             [self{shared_from_this()}, out, total,
               cb{std::move(cb)}](auto _n) mutable {
                OUTCOME_CB(n, _n);
-               self->already_read_ += n;
-               self->read(out.subspan(n), bytes - n, std::move(cb));
+               BOOST_ASSERT(n <= spanSize(out));
+               if (n == spanSize(out)) {
+                 return cb(total);
+               }
+               self->readFull(out.subspan(n), total, std::move(cb));
              });
   }
 
@@ -84,7 +84,7 @@ namespace libp2p::connection {
     if (not frame_buffer_->empty()) {
       auto n{std::min(bytes, frame_buffer_->size())};
       auto begin{frame_buffer_->begin()};
-      auto end{begin + n};
+      auto end{begin + gsl::narrow<ptrdiff_t>(n)};
       std::copy(begin, end, out.begin());
       frame_buffer_->erase(begin, end);
       return cb(n);
@@ -100,31 +100,38 @@ namespace libp2p::connection {
 
   void NoiseConnection::write(gsl::span<const uint8_t> in, size_t bytes,
                               libp2p::basic::Writer::WriteCallbackFunc cb) {
-    if (0 == plaintext_len_to_write_) {
-      plaintext_len_to_write_ = bytes;
-    }
-    if (bytes == 0) {
-      BOOST_ASSERT(already_wrote_ >= plaintext_len_to_write_);
-      auto n{plaintext_len_to_write_};
-      already_wrote_ = 0;
-      plaintext_len_to_write_ = 0;
-      return cb(n);
-    }
-    auto n{std::min(bytes, security::noise::kMaxPlainText)};
-    OUTCOME_CB(encrypted, encoder_cs_->encrypt({}, in.subspan(0, n), {}));
-    writing_ = std::move(encrypted);
-    framer_->write(writing_,
-                   [self{shared_from_this()}, in{in.subspan(n)},
-                    bytes{bytes - n}, cb{std::move(cb)}](auto _n) mutable {
-                     OUTCOME_CB(n, _n);
-                     self->already_wrote_ += n;
-                     self->write(in, bytes, std::move(cb));
-                   });
+    BOOST_ASSERT(spanSize(in) >= bytes);
+    writeFull(in.first(gsl::narrow<ptrdiff_t>(bytes)), bytes, std::move(cb));
+  }
+
+  void NoiseConnection::writeFull(gsl::span<const uint8_t> in, size_t total,
+                                  basic::Writer::WriteCallbackFunc cb) {
+    writeSome(in, in.size(),
+              [self{shared_from_this()}, in, total,
+               cb{std::move(cb)}](auto _n) mutable {
+                OUTCOME_CB(n, _n);
+                BOOST_ASSERT(n <= spanSize(in));
+                if (n == spanSize(in)) {
+                  return cb(total);
+                }
+                self->writeFull(in.subspan(n), total, std::move(cb));
+              });
   }
 
   void NoiseConnection::writeSome(gsl::span<const uint8_t> in, size_t bytes,
                                   libp2p::basic::Writer::WriteCallbackFunc cb) {
-    write(in, bytes, std::move(cb));
+    const auto n{std::min(bytes, security::noise::kMaxPlainText)};
+    if (n == 0) {
+      return cb(n);
+    }
+    OUTCOME_CB(encrypted, encoder_cs_->encrypt({}, in.subspan(0, n), {}));
+    writing_ = std::move(encrypted);
+    framer_->write(writing_, [cb{std::move(cb)}, n](auto _n) {
+      if (!_n) {
+        return cb(_n.error());
+      }
+      cb(n);
+    });
   }
 
   void NoiseConnection::deferReadCallback(outcome::result<size_t> res,
