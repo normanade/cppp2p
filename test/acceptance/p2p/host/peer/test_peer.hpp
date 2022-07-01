@@ -82,7 +82,7 @@ class Peer {
  private:
   sptr<BasicHost> makeHost(const KeyPair &keyPair);
 
-  static libp2p::network::c_ares::Ares cares_;  ///< c-ares library instance
+  static const libp2p::network::c_ares::Ares cares_;  ///< c-ares library instance
   MuxedConnectionConfig muxed_config_;          ///< muxed connection config
   const Duration timeout_;                      ///< operations timeout
   sptr<Context> context_;                       ///< io context

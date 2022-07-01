@@ -8,5 +8,5 @@
 namespace libp2p::host::detail {
 
   // suppresses "no symbols" warning from linker
-  const char *__library_name = "default host library implementation";
+  const char * const __library_name = "default host library implementation";
 }  // namespace libp2p::host::detail
